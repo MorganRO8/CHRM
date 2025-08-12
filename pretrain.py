@@ -18,9 +18,11 @@ import pydantic
 from omegaconf import DictConfig
 from adam_atan2 import AdamATan2
 
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+import numpy as np
+
+from chem_dataset import ChemDataset, ChemDatasetConfig
+from dataset.common import ChemDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
-from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 
 
 class LossConfig(pydantic.BaseModel):
@@ -54,9 +56,10 @@ class PretrainConfig(pydantic.BaseModel):
     beta1: float
     beta2: float
 
-    # Puzzle embedding
-    puzzle_emb_lr: float
-    puzzle_emb_weight_decay: float
+    # Chemistry specific
+    cutoff_radius: float = 5.0
+    energy_weight: float = 1.0
+    force_weight: float = 1.0
 
     # Names
     project_name: Optional[str] = None
@@ -82,39 +85,34 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    dataset = PuzzleDataset(PuzzleDatasetConfig(
-        seed=config.seed,
-
-        dataset_path=config.data_path,
-
-        rank=rank,
-        num_replicas=world_size,
-        
-        **kwargs
-    ), split=split)
+    dataset = ChemDataset(
+        ChemDatasetConfig(
+            seed=config.seed,
+            dataset_path=config.data_path,
+            rank=rank,
+            num_replicas=world_size,
+            **kwargs,
+        ),
+        split=split,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-
         num_workers=1,
         prefetch_factor=8,
-
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True,
     )
     return dataloader, dataset.metadata
 
 
-def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+def create_model(config: PretrainConfig, train_metadata: ChemDatasetMetadata, world_size: int):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
-
         batch_size=config.global_batch_size // world_size,
-
-        vocab_size=train_metadata.vocab_size,
-        seq_len=train_metadata.seq_len,
-        num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
+        vocab_size=train_metadata.num_atom_types,
+        seq_len=train_metadata.max_atoms,
+        causal=False,  # Non-autoregressive
     )
 
     # Instantiate model with loss head
@@ -123,7 +121,12 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        model = loss_head_cls(
+            model,
+            energy_weight=config.energy_weight,
+            force_weight=config.force_weight,
+            **config.arch.loss.__pydantic_extra__,
+        )  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model, dynamic=False)  # type: ignore
 
@@ -133,28 +136,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers and lr
+    # Optimizer and learning rate
     optimizers = [
-        CastedSparseEmbeddingSignSGD_Distributed(
-            model.model.puzzle_emb.buffers(),  # type: ignore
-            
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.puzzle_emb_weight_decay,
-
-            world_size=world_size
-        ),
         AdamATan2(
             model.parameters(),
-
             lr=0,  # Needs to be set by scheduler
             weight_decay=config.weight_decay,
-            betas=(config.beta1, config.beta2)
+            betas=(config.beta1, config.beta2),
         )
     ]
-    optimizer_lrs = [
-        config.puzzle_emb_lr,
-        config.lr
-    ]
+    optimizer_lrs = [config.lr]
 
     return model, optimizers, optimizer_lrs
 
@@ -169,12 +160,21 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
-def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+def init_train_state(config: PretrainConfig, train_metadata: ChemDatasetMetadata, world_size: int):
     # Estimated total training steps
-    total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
+    total_examples = 0
+    for set_name in train_metadata.sets:
+        atom_types_path = os.path.join(
+            config.data_path, "train", f"{set_name}__atom_types.npy"
+        )
+        total_examples += np.load(atom_types_path, mmap_mode="r").shape[0]
+
+    total_steps = int(config.epochs * total_examples / config.global_batch_size)
 
     # Model
-    model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size=world_size)
+    model, optimizers, optimizer_lrs = create_model(
+        config, train_metadata, world_size=world_size
+    )
 
     return TrainState(
         step=0,
@@ -263,27 +263,32 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             return reduced_metrics
 
 
-def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def evaluate(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: ChemDatasetMetadata,
+    rank: int,
+    world_size: int,
+):
     with torch.inference_mode():
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
-        
-        all_preds = {}
 
-        metric_keys = []
-        metric_values = None
-        metric_global_batch_size = [0 for _ in range(len(set_ids))]
-        
+        all_preds = {}
+        metric_values = torch.zeros(
+            (len(set_ids), 6), dtype=torch.float32, device="cuda"
+        )
+
         carry = None
-        for set_name, batch, global_batch_size in eval_loader:
-            # To device
+        for set_name, batch, _ in eval_loader:
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
-            # Forward
             while True:
-                carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
-                
+                carry, _, _, preds, all_finish = train_state.model(
+                    carry=carry, batch=batch, return_keys=["energy", "forces"]
+                )
                 if all_finish:
                     break
 
@@ -291,43 +296,68 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                 for k, v in collection.items():
                     if k in config.eval_save_outputs:
                         all_preds.setdefault(k, [])
-                        all_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
-                        
-            del carry, preds, batch, all_finish
+                        all_preds[k].append(v.cpu())
 
-            # Aggregate
+            energy_pred = preds["energy"]
+            energy_target = batch["energy"]
+            abs_err = (energy_pred - energy_target).abs().sum()
+            sq_err = (energy_pred - energy_target).pow(2).sum()
+
             set_id = set_ids[set_name]
-            
-            if metric_values is None:
-                metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
-                
-            metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
-            metric_global_batch_size[set_id] += global_batch_size
+            metric_values[set_id, 0] += abs_err
+            metric_values[set_id, 1] += sq_err
+            metric_values[set_id, 4] += batch["atom_types"].shape[0]
+
+            if "forces" in preds and "forces" in batch:
+                force_pred = preds["forces"]
+                force_target = batch["forces"]
+                metric_values[set_id, 2] += (force_pred - force_target).abs().sum()
+                metric_values[set_id, 3] += (force_pred - force_target).pow(2).sum()
+                metric_values[set_id, 5] += force_target.numel()
+
+            del carry, preds, batch, all_finish
 
         if len(all_preds) and config.checkpoint_path is not None:
             all_preds = {k: torch.cat(v, dim=0) for k, v in all_preds.items()}
-
             os.makedirs(config.checkpoint_path, exist_ok=True)
-            torch.save(all_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}"))
+            torch.save(
+                all_preds,
+                os.path.join(
+                    config.checkpoint_path,
+                    f"step_{train_state.step}_all_preds.{rank}",
+                ),
+            )
 
-        # Logging
-        # Reduce to rank 0
-        if metric_values is not None:
-            if world_size > 1:
-                dist.reduce(metric_values, dst=0)
-            
-            if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
-                reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
-                                   for set_id, set_name in enumerate(set_ids)}
-                
-                # Postprocess
-                for set_name, metrics in reduced_metrics.items():
-                    count = metrics.pop("count")
-                    reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
+        if world_size > 1:
+            dist.reduce(metric_values, dst=0)
 
-                return reduced_metrics
+        if rank == 0:
+            reduced_metrics = {}
+            for set_name, set_id in set_ids.items():
+                count = max(metric_values[set_id, 4].item(), 1.0)
+                energy_mae = metric_values[set_id, 0].item() / count
+                energy_rmse = (
+                    metric_values[set_id, 1].item() / count
+                ) ** 0.5
+                metrics = {
+                    "energy_mae": energy_mae,
+                    "energy_rmse": energy_rmse,
+                }
+                force_count = metric_values[set_id, 5].item()
+                if force_count > 0:
+                    metrics.update(
+                        {
+                            "force_mae": metric_values[set_id, 2].item()
+                            / force_count,
+                            "force_rmse": (
+                                metric_values[set_id, 3].item() / force_count
+                            )
+                            ** 0.5,
+                        }
+                    )
+                reduced_metrics[set_name] = metrics
+
+            return reduced_metrics
 
 
 def save_code_and_config(config: PretrainConfig):
