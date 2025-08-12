@@ -107,7 +107,8 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
 
         self.atom_type_embed = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.coord_encoder  = CastedLinear(3, self.config.hidden_size, bias=False)
-        self.lm_head        = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # Predict per-atom energy contributions
+        self.energy_head    = CastedLinear(self.config.hidden_size, 1, bias=False)
         self.q_head         = CastedLinear(self.config.hidden_size, 2, bias=True)
 
         # LM Blocks
@@ -188,14 +189,14 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.H_level(z_H, z_L, **seq_info)
 
-        # LM Outputs
+        # Energy output
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)
+        energy = self.energy_head(z_H).squeeze(-1)
 
         # Q head
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+
+        return new_carry, energy, (q_logits[..., 0], q_logits[..., 1])
 
 
 class HierarchicalReasoningModel_ACTV1(nn.Module):
@@ -227,10 +228,10 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, energy, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
-            "logits": logits,
+            "energy": energy,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits
         }
