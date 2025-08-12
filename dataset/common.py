@@ -24,6 +24,18 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     sets: List[str]
 
 
+class ChemDatasetMetadata(pydantic.BaseModel):
+    """Metadata describing a molecular dataset."""
+
+    pad_atom_type: int
+    num_atom_types: int
+    max_atoms: int
+    pos_dim: int
+    has_forces: bool
+
+    sets: List[str]
+
+
 def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     """8 dihedral symmetries by rotate, flip and mirror"""
     
