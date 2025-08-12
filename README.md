@@ -171,6 +171,23 @@ OMP_NUM_THREADS=8 torchrun --nproc-per-node 8 evaluate.py checkpoint=<CHECKPOINT
 
 * Then use the provided `arc_eval.ipynb` notebook to finalize and inspect your results.
 
+### Molecular datasets
+
+Chemistry checkpoints can be evaluated and visualized using `evaluate_chem.py`.
+The script computes energy and force errors and can optionally write predicted
+structures to standard formats for inspection in external tools.
+
+```bash
+# Write predictions to XYZ and ASE trajectory files
+python evaluate_chem.py \
+    checkpoint=<CHECKPOINT_PATH> \
+    xyz_path=predictions.xyz \
+    traj_path=predictions.traj
+```
+
+Both `xyz_path` and `traj_path` are optional.  Install
+[`ase`](https://pypi.org/project/ase/) to enable trajectory writing.
+
 ## Notes
 
  - Small-sample learning typically exhibits accuracy variance of around ±2 points.
