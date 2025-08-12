@@ -37,12 +37,24 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
+def energy_mse_loss(pred, target):
+    """Mean squared error loss for energies."""
+    return F.mse_loss(pred, target, reduction="sum")
+
+
+def force_mse_loss(energy: torch.Tensor, positions: torch.Tensor, target_forces: torch.Tensor):
+    """Force loss computed from energy gradient w.r.t. positions."""
+    forces = -torch.autograd.grad(energy.sum(), positions, create_graph=True)[0]
+    loss = F.mse_loss(forces, target_forces, reduction="sum")
+    return loss, forces
+
+
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, loss_type: str = "energy_mse_loss"):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
-        
+
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
@@ -52,50 +64,34 @@ class ACTLossHead(nn.Module):
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
-        # Model logits
-        # B x SeqLen x D
+
+        batch = model_kwargs["batch"]
+        requires_forces = "forces" in batch
+        if requires_forces:
+            batch["positions"] = batch["positions"].requires_grad_(True)
+
         new_carry, outputs = self.model(**model_kwargs)
-        labels = new_carry.current_data["labels"]
 
-        # Correctness
-        with torch.no_grad():
-            mask = labels != IGNORE_LABEL_ID
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
+        # Energy loss
+        energy_pred = outputs["energy"].sum(-1)
+        energy_target = new_carry.current_data["energy"]
+        energy_loss = self.loss_fn(energy_pred, energy_target)
+        outputs["energy"] = energy_pred
 
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
-            
-            # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
-            metrics = {
-                "count": valid_metrics.sum(),
-                
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
-                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+        metrics: Dict[str, torch.Tensor] = {
+            "count": torch.tensor(batch["atom_types"].shape[0], device=energy_loss.device),
+            "energy_loss": energy_loss.detach(),
+        }
 
-                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
-            }
+        total_loss = energy_loss
 
-        # Losses
-        # FIXME: Assuming the batch is always full
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        # Force loss if available
+        if requires_forces:
+            force_loss, forces = force_mse_loss(energy_pred, batch["positions"], new_carry.current_data["forces"])
+            total_loss = total_loss + force_loss
+            metrics["force_loss"] = force_loss.detach()
+            outputs["forces"] = forces
 
-        metrics.update({
-            "lm_loss": lm_loss.detach(),
-            "q_halt_loss": q_halt_loss.detach(),
-        })
-
-        # Q continue (bootstrapping target loss)
-        q_continue_loss = 0
-        if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
-
-            metrics["q_continue_loss"] = q_continue_loss.detach()
-
-        # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
