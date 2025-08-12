@@ -12,8 +12,8 @@ from pretrain import PretrainConfig, init_train_state, evaluate, create_dataload
 
 class EvalConfig(pydantic.BaseModel):
     checkpoint: str
-    
-    save_outputs: List[str] = ["inputs", "labels", "puzzle_identifiers", "logits", "q_halt_logits", "q_continue_logits"]
+
+    save_outputs: List[str] = ["atom_types", "positions", "energy", "forces", "q_halt_logits", "q_continue_logits"]
 
 
 def launch():

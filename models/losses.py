@@ -50,10 +50,18 @@ def force_mse_loss(energy: torch.Tensor, positions: torch.Tensor, target_forces:
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str = "energy_mse_loss"):
+    def __init__(
+        self,
+        model: nn.Module,
+        loss_type: str = "energy_mse_loss",
+        energy_weight: float = 1.0,
+        force_weight: float = 1.0,
+    ):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.energy_weight = energy_weight
+        self.force_weight = force_weight
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -83,12 +91,14 @@ class ACTLossHead(nn.Module):
             "energy_loss": energy_loss.detach(),
         }
 
-        total_loss = energy_loss
+        total_loss = self.energy_weight * energy_loss
 
         # Force loss if available
         if requires_forces:
-            force_loss, forces = force_mse_loss(energy_pred, batch["positions"], new_carry.current_data["forces"])
-            total_loss = total_loss + force_loss
+            force_loss, forces = force_mse_loss(
+                energy_pred, batch["positions"], new_carry.current_data["forces"]
+            )
+            total_loss = total_loss + self.force_weight * force_loss
             metrics["force_loss"] = force_loss.detach()
             outputs["forces"] = forces
 
